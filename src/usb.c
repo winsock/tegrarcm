@@ -33,6 +33,7 @@
 #include <sys/param.h>
 #include "usb.h"
 #include "debug.h"
+#include "soc.h"
 
 // USB xfer timeout in ms
 #define USB_TIMEOUT 1000
@@ -42,7 +43,7 @@
 //
 // returns 1 if the specified usb device matches the vendor id
 //
-static int usb_match(libusb_device *dev, uint16_t venid, uint16_t *devid
+static struct soc *usb_match(libusb_device *dev, uint16_t venid, uint16_t *devid
 #ifdef HAVE_USB_PORT_MATCH
 	,
 	bool *match_port, uint8_t *match_bus, uint8_t *match_ports,
@@ -73,17 +74,7 @@ static int usb_match(libusb_device *dev, uint16_t venid, uint16_t *devid
 			desc.idVendor, desc.idProduct);
 		return 0;
 	}
-	switch (desc.idProduct & 0xff) {
-	case USB_DEVID_NVIDIA_TEGRA20:
-	case USB_DEVID_NVIDIA_TEGRA30:
-	case USB_DEVID_NVIDIA_TEGRA114:
-	case USB_DEVID_NVIDIA_TEGRA124:
-		break;
-	default:
-		dprintf("non-Tegra NVIDIA USB device: 0x%x:0x%x\n",
-			desc.idVendor, desc.idProduct);
-		return 0;
-	}
+    
 #ifdef HAVE_USB_PORT_MATCH
 	dev_bus = libusb_get_bus_number(dev);
 	dev_ports_len = libusb_get_port_numbers(dev, dev_ports,
@@ -125,11 +116,16 @@ static int usb_match(libusb_device *dev, uint16_t venid, uint16_t *devid
 #endif
 	}
 #endif
-
-	dprintf("device matches\n");
-	*devid = desc.idProduct;
-
-	return 1;
+    struct soc *soc = soc_detect(desc.idProduct);
+    if (soc) {
+        dprintf("device matches\n");
+        *devid = desc.idProduct;
+        return soc;
+    }
+    free(soc);
+    dprintf("non-Tegra NVIDIA USB device or unsupported SoC: 0x%x:0x%x\n",
+            desc.idVendor, desc.idProduct);
+	return 0;
 }
 
 static void usb_check_interface(const struct libusb_interface_descriptor *iface_desc,
@@ -220,7 +216,7 @@ usb_device_t *usb_open(uint16_t venid, uint16_t *devid
 {
 	libusb_device **list = NULL;
 	libusb_device *found = NULL;
-	ssize_t cnt, i=0;
+	ssize_t cnt, i = 0;
 	usb_device_t *usb = NULL;
 
 	if (libusb_init(NULL)) {
@@ -233,18 +229,24 @@ usb_device_t *usb_open(uint16_t venid, uint16_t *devid
 		dprintf("libusb_get_device_list\n");
 		goto fail;
 	}
+    
+    usb = malloc(sizeof(usb_device_t));
+    if (!usb) {
+        dprintf("out of mem\n");
+        goto fail;
+    }
+    memset(usb, 0, sizeof(usb_device_t));
 
 	for (i = 0; i < cnt; i++) {
 		libusb_device *device = list[i];
-
-		if (usb_match(device, venid, devid
+        usb->soc = usb_match(device, venid, devid
 #ifdef HAVE_USB_PORT_MATCH
-				, match_port, match_bus, match_ports,
-				match_ports_len
+                             , match_port, match_bus, match_ports,
+                             match_ports_len
 #endif
-		)) {
-			found = device;
-			break;
+                             );
+		if (usb->soc) {
+            break;
 		}
 	}
 
@@ -252,13 +254,6 @@ usb_device_t *usb_open(uint16_t venid, uint16_t *devid
 		dprintf("could't find device\n");
 		goto fail;
 	}
-
-	usb = (usb_device_t *)malloc(sizeof(usb_device_t));
-	if (!usb) {
-		dprintf("out of mem\n");
-		goto fail;
-	}
-	memset(usb, 0, sizeof(usb_device_t));
 
 	if (libusb_open(found, &usb->handle)) {
 		dprintf("libusb_open failed\n");
@@ -279,6 +274,8 @@ usb_device_t *usb_open(uint16_t venid, uint16_t *devid
 	return usb;
 
 fail:
+    if (usb && usb->soc)
+        free(usb->soc);
 	if (usb)
 		free(usb);
 	if (list)
@@ -290,6 +287,8 @@ void usb_close(usb_device_t *usb)
 {
 	if (!usb)
 		return;
+    if (usb && usb->soc)
+        free(usb->soc);
 	if (usb->initialized) {
 		libusb_release_interface(usb->handle, usb->iface_num);
 		if (usb->handle)
@@ -298,7 +297,7 @@ void usb_close(usb_device_t *usb)
 	libusb_exit(NULL);
 }
 
-int usb_write(usb_device_t *usb, uint8_t *buf, int len)
+int usb_write(usb_device_t *usb, const void *buf, int len)
 {
 	int ret;
 	int chunk_size;
@@ -306,7 +305,7 @@ int usb_write(usb_device_t *usb, uint8_t *buf, int len)
 
 	while (len) {
 		chunk_size = MIN(len, USB_XFER_MAX);
-		ret = libusb_bulk_transfer(usb->handle, usb->endpt_out, buf,
+		ret = libusb_bulk_transfer(usb->handle, usb->endpt_out, (void *)buf,
 					   chunk_size, &actual_chunk, USB_TIMEOUT);
 		if (ret != LIBUSB_SUCCESS) {
 			dprintf("libusb write failure: %d: %s\n", ret, libusb_error_name(ret));
@@ -323,7 +322,7 @@ int usb_write(usb_device_t *usb, uint8_t *buf, int len)
 	return 0;
 }
 
-int usb_read(usb_device_t *usb, uint8_t *buf, int len, int *actual_len)
+int usb_read(usb_device_t *usb, void *buf, int len, int *actual_len)
 {
 	int ret;
 	int chunk_size;

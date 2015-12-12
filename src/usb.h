@@ -31,6 +31,7 @@
 
 #include <stdbool.h>
 #include <libusb.h>
+#include "soc.h"
 
 #if defined(LIBUSBX_API_VERSION) && (LIBUSBX_API_VERSION >= 0x01000102)
 #define HAVE_USB_PORT_MATCH
@@ -38,10 +39,6 @@
 #endif
 
 #define USB_VENID_NVIDIA 0x955
-#define USB_DEVID_NVIDIA_TEGRA20 0x20
-#define USB_DEVID_NVIDIA_TEGRA30 0x30
-#define USB_DEVID_NVIDIA_TEGRA114 0x35
-#define USB_DEVID_NVIDIA_TEGRA124 0x40
 
 typedef struct {
 	libusb_device_handle *handle;
@@ -49,6 +46,7 @@ typedef struct {
 	uint8_t endpt_in;
 	uint8_t endpt_out;
 	int initialized;
+    const struct soc *soc;
 } usb_device_t;
 
 usb_device_t *usb_open(uint16_t venid, uint16_t *devid
@@ -59,8 +57,8 @@ usb_device_t *usb_open(uint16_t venid, uint16_t *devid
 #endif
 );
 void usb_close(usb_device_t *usb);
-int usb_write(usb_device_t *usb, uint8_t *buf, int len);
-int usb_read(usb_device_t *usb, uint8_t *buf, int len, int *actual_len);
+int usb_write(usb_device_t *usb, const void *buf, int len);
+int usb_read(usb_device_t *usb, void *buf, int len, int *actual_len);
 
 
 #endif // USB_H

@@ -18,6 +18,12 @@ tegrarcm_SOURCES = \
 	miniloader/tegra30-miniloader.h \
 	miniloader/tegra114-miniloader.h \
 	miniloader/tegra124-miniloader.h \
+	miniloader/tegra132-miniloader.h \
+	miniloader/tegra132-preboot-mts.h \
+	miniloader/tegra132-mts.h \
+	common.h \
+	soc.c \
+	soc.h \
 	usb.h
 
 man_MANS = tegrarcm.1

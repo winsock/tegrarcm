@@ -1,6 +1,5 @@
 /*
- * Copyright (c) 2011, NVIDIA CORPORATION
- * All rights reserved.
+ * Copyright (c) 2015, NVIDIA CORPORATION. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -26,64 +25,19 @@
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-#include <iostream>
-using std::cout;
-using std::cerr;
-using std::endl;
 
-#include <iomanip>
-using std::hex;
+#ifndef _COMMON_H
+#define _COMMON_H
 
-#include <string>
-using std::string;
+#include <stdint.h>
+#include <stdlib.h>
 
-#include <cstdlib>
-using std::exit;
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 
-#include <cryptopp/cryptlib.h>
-using CryptoPP::Exception;
+struct binary {
+	const void *data;
+	size_t size;
+	uint32_t entry;
+};
 
-#include <cryptopp/cmac.h>
-using CryptoPP::CMAC;
-
-#include <cryptopp/aes.h>
-using CryptoPP::AES;
-
-#include <cryptopp/hex.h>
-using CryptoPP::HexEncoder;
-using CryptoPP::HexDecoder;
-
-#include <cryptopp/filters.h>
-using CryptoPP::StringSink;
-using CryptoPP::StringSource;
-using CryptoPP::HashFilter;
-using CryptoPP::HashVerificationFilter;
-
-#include <cryptopp/secblock.h>
-using CryptoPP::SecByteBlock;
-
-extern "C" int cmac_hash(const unsigned char *msg, int len, unsigned char *cmac_buf)
-{
-	SecByteBlock key(NULL, AES::DEFAULT_KEYLENGTH);
-
-	string plain((const char *)msg, len);
-	string mac, encoded;
-
-	try {
-		CMAC<AES> cmac(key, key.size());
-
-		StringSource(plain, true,
-			new HashFilter(cmac,
-				new StringSink(mac)
-				) // HashFilter
-			); // StringSource
-	}
-	catch(const CryptoPP::Exception& e) {
-		cerr << e.what() << endl;
-		return 1;
-	}
-
-	memcpy(cmac_buf, mac.data(), mac.length());
-
-	return 0;
-}
+#endif

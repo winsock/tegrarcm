@@ -26,12 +26,33 @@
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <errno.h>
 #include <string.h>
+char const *program_name;
+#if defined(__GNUG__)
 #include <error.h>
+#else
+#include <err.h>
+#define error(status, errornum, format, ...) \
+    _error(status, format, program_name, ##__VA_ARGS__, strerror(errornum))
+
+void _error(int status, const char *format, ...) {
+    char *new_format = malloc(strlen("%s: ") + strlen(format) + strlen(": %s"));
+    strcat(new_format, "%s: ");
+    strcat(new_format, format);
+    strcat(new_format, ": %s");
+    va_list error_args;
+    va_start(error_args, format);
+    verr(status, new_format, error_args);
+    va_end(error_args);
+}
+#endif
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -48,28 +69,18 @@
 #include "debug.h"
 #include "config.h"
 
-// tegra20 miniloader
-#include "miniloader/tegra20-miniloader.h"
-
-// tegra30 miniloader
-#include "miniloader/tegra30-miniloader.h"
-
-// tegra114 miniloader
-#include "miniloader/tegra114-miniloader.h"
-
-// tegra124 miniloader
-#include "miniloader/tegra124-miniloader.h"
-
-static int initialize_rcm(uint16_t devid, usb_device_t *usb);
-static int initialize_miniloader(uint16_t devid, usb_device_t *usb, char *mlfile, uint32_t mlentry);
+static int initialize_rcm(usb_device_t *usb);
+static int initialize_miniloader(usb_device_t *usb,
+				 const char *filename, uint32_t entry);
+static int initialize_preboot(usb_device_t *usb, const char *filename, uint32_t entry);
 static int wait_status(nv3p_handle_t h3p);
 static int send_file(nv3p_handle_t h3p, const char *filename);
-static int download_miniloader(usb_device_t *usb, uint8_t *miniloader,
-			       uint32_t size, uint32_t entry);
+static int download_binary(uint32_t cmd, usb_device_t *usb, struct binary *binary);
 static void dump_platform_info(nv3p_platform_info_t *info);
 static int download_bct(nv3p_handle_t h3p, char *filename);
 static int download_bootloader(nv3p_handle_t h3p, char *filename,
 			       uint32_t entry, uint32_t loadaddr);
+static int download_mts(nv3p_handle_t h3p, char *filename, uint32_t loadaddr);
 static int read_bct(nv3p_handle_t h3p, char *filename);
 
 enum cmdline_opts {
@@ -81,6 +92,11 @@ enum cmdline_opts {
 	OPT_VERSION,
 	OPT_MINILOADER,
 	OPT_MINIENTRY,
+	OPT_MINIENTRY1,
+	OPT_PREBOOT,
+	OPT_PREBOOTENTRY,
+	OPT_MTS,
+	OPT_MTSENTRY,
 #ifdef HAVE_USB_PORT_MATCH
 	OPT_USBPORTPATH,
 #endif
@@ -123,6 +139,14 @@ static void usage(char *progname)
 	fprintf(stderr, "\t\tminiloader\n");
 	fprintf(stderr, "\t--miniloader_entry=<mlentry>\n");
 	fprintf(stderr, "\t\tSpecify the entry point for the miniloader\n");
+	fprintf(stderr, "\t--preboot=pbfile\n");
+	fprintf(stderr, "\t\tRead the preboot ucode from given file\n");
+	fprintf(stderr, "\t--preboot-entry=<pbentry>\n");
+	fprintf(stderr, "\t\tSpecify the entry point for the preboot ucode\n");
+	fprintf(stderr, "\t--mts=mtsfile\n");
+	fprintf(stderr, "\t\tRead the cpu ucode from given file\n");
+	fprintf(stderr, "\t--mts-entry=<mtsentry>\n");
+	fprintf(stderr, "\t\tSpecify the entry point for the cpu ucode\n");
 	fprintf(stderr, "\n");
 }
 
@@ -158,6 +182,8 @@ static void parse_usb_port_path(char *argv0, char *path, uint8_t *match_bus,
 
 int main(int argc, char **argv)
 {
+    program_name = argv[0];
+    
 	// discover devices
 	uint64_t uid[2];
 	int actual_len;
@@ -175,6 +201,10 @@ int main(int argc, char **argv)
 	int do_read = 0;
 	char *mlfile = NULL;
 	uint32_t mlentry = 0;
+	char *pbfile = NULL;
+	uint32_t pbentry = 0;
+	char *mtsfile = NULL;
+	uint32_t mtsentry = 0;
 #ifdef HAVE_USB_PORT_MATCH
 	bool match_port = false;
 	uint8_t match_bus;
@@ -191,6 +221,11 @@ int main(int argc, char **argv)
 		[OPT_VERSION]    = {"version", 0, 0, 0},
 		[OPT_MINILOADER] = {"miniloader", 1, 0, 0},
 		[OPT_MINIENTRY]  = {"miniloader_entry", 1, 0, 0},
+		[OPT_MINIENTRY1] = {"miniloader-entry", 1, 0, 0},
+		[OPT_PREBOOT]    = {"preboot", 1, 0, 0},
+		[OPT_PREBOOTENTRY] = {"preboot-entry", 1, 0, 0},
+		[OPT_MTS]        = {"mts", 1, 0, 0},
+		[OPT_MTSENTRY]   = {"mts-entry", 1, 0, 0},
 #ifdef HAVE_USB_PORT_MATCH
 		[OPT_USBPORTPATH]  = {"usb-port-path", 1, 0, 0},
 #endif
@@ -227,7 +262,20 @@ int main(int argc, char **argv)
 				mlfile = optarg;
 				break;
 			case OPT_MINIENTRY:
+			case OPT_MINIENTRY1:
 				mlentry = strtoul(optarg, NULL, 0);
+				break;
+			case OPT_PREBOOT:
+				pbfile = optarg;
+				break;
+			case OPT_PREBOOTENTRY:
+				pbentry = strtoul(optarg, NULL, 0);
+				break;
+			case OPT_MTS:
+				mtsfile = optarg;
+				break;
+			case OPT_MTSENTRY:
+				mtsentry = strtoul(optarg, NULL, 0);
 				break;
 #ifdef HAVE_USB_PORT_MATCH
 			case OPT_USBPORTPATH:
@@ -295,7 +343,8 @@ int main(int argc, char **argv)
 	);
 	if (!usb)
 		error(1, errno, "could not open USB device");
-	printf("device id: 0x%x\n", devid);
+    
+	printf("NVIDIA %s detected\n", usb->soc->name);
 
 	ret = usb_read(usb, (uint8_t *)uid, sizeof(uid), &actual_len);
 	if (!ret) {
@@ -308,17 +357,25 @@ int main(int argc, char **argv)
 			error(1, errno, "USB read truncated");
 
 		// initialize rcm
-		ret2 = initialize_rcm(devid, usb);
+		ret2 = initialize_rcm(usb);
 		if (ret2)
 			error(1, errno, "error initializing RCM protocol");
 
+		// download the mts_preboot ucode
+		if (usb->soc->needs_mts) {
+			ret2 = initialize_preboot(usb, pbfile, pbentry);
+			if (ret2)
+				error(1, errno, "error initializing preboot mts");
+		}
+
 		// download the miniloader to start nv3p
-		ret2 = initialize_miniloader(devid, usb, mlfile, mlentry);
+		ret2 = initialize_miniloader(usb, mlfile, mlentry);
 		if (ret2)
 			error(1, errno, "error initializing miniloader");
 
 		// device may have re-enumerated, so reopen USB
 		usb_close(usb);
+		sleep(1);
 		usb = usb_open(USB_VENID_NVIDIA, &devid
 #ifdef HAVE_USB_PORT_MATCH
 		, &match_port, &match_bus, match_ports, &match_ports_len
@@ -365,6 +422,13 @@ int main(int argc, char **argv)
 		error(1, ret, "error downloading bct: %s", bctfile);
 	}
 
+	// download mts
+	if (usb->soc->needs_mts) {
+		ret = download_mts(h3p, mtsfile, mtsentry);
+		if (ret)
+			error(1, ret, "error downloading mts: %s", mtsfile);
+	}
+
 	// download the bootloader
 	ret = download_bootloader(h3p, blfile, entryaddr, loadaddr);
 	if (ret)
@@ -376,39 +440,18 @@ int main(int argc, char **argv)
 	return 0;
 }
 
-static int initialize_rcm(uint16_t devid, usb_device_t *usb)
+static int initialize_rcm(usb_device_t *usb)
 {
-	int ret;
-	uint8_t *msg_buff;
-	int msg_len;
+	int ret, msg_len, actual_len;
 	uint32_t status;
-	int actual_len;
-
-	// initialize RCM
-	if ((devid & 0xff) == USB_DEVID_NVIDIA_TEGRA20 ||
-	    (devid & 0xff) == USB_DEVID_NVIDIA_TEGRA30) {
-		dprintf("initializing RCM version 1\n");
-		ret = rcm_init(RCM_VERSION_1);
-	} else if ((devid & 0xff) == USB_DEVID_NVIDIA_TEGRA114) {
-		dprintf("initializing RCM version 35\n");
-		ret = rcm_init(RCM_VERSION_35);
-	} else if ((devid & 0xff) == USB_DEVID_NVIDIA_TEGRA124) {
-		dprintf("initializing RCM version 40\n");
-		ret = rcm_init(RCM_VERSION_40);
-	} else {
-		fprintf(stderr, "unknown tegra device: 0x%x\n", devid);
-		return errno;
-	}
-	if (ret) {
-		fprintf(stderr, "RCM initialize failed\n");
-		return ret;
-	}
+	void *msg_buff;
 
 	// create query version message
-	rcm_create_msg(RCM_CMD_QUERY_RCM_VERSION, NULL, 0, NULL, 0, &msg_buff);
+	rcm_create_msg(usb->soc->rcm, RCM_CMD_QUERY_RCM_VERSION, NULL, 0, NULL, 0,
+		       &msg_buff);
 
 	// write query version message to device
-	msg_len = rcm_get_msg_len(msg_buff);
+	msg_len = rcm_get_msg_len(usb->soc->rcm, msg_buff);
 	if (msg_len == 0) {
 		fprintf(stderr, "write RCM query version: unknown message length\n");
 		return EINVAL;
@@ -437,14 +480,64 @@ static int initialize_rcm(uint16_t devid, usb_device_t *usb)
 	return 0;
 }
 
-static int initialize_miniloader(uint16_t devid, usb_device_t *usb, char *mlfile, uint32_t mlentry)
+static int initialize_preboot(usb_device_t *usb, const char *filename, uint32_t entry)
 {
-	int fd;
+	struct binary preboot;
 	struct stat sb;
-	int ret;
-	uint8_t *miniloader;
-	uint32_t miniloader_size;
-	uint32_t miniloader_entry;
+	int fd, ret;
+	void *data;
+
+	if (!filename)
+		return -EINVAL;
+
+	fd = open(filename, O_RDONLY, 0);
+	if (fd < 0) {
+		dprintf("error opening %s for reading\n", filename);
+		return -errno;
+	}
+
+	ret = fstat(fd, &sb);
+	if (ret) {
+		dprintf("error on fstat of %s\n", filename);
+		return -errno;
+	}
+
+	data = malloc(sb.st_size);
+	if (!data) {
+		dprintf("error allocating %zu bytes for preboot mts\n",
+			sb.st_size);
+		return -errno;
+	}
+
+	if (read(fd, data, sb.st_size) != sb.st_size) {
+		dprintf("error reading from preboot mts file");
+		return -errno;
+	}
+
+	preboot.size = sb.st_size;
+	preboot.entry = entry;
+	preboot.data = data;
+
+	printf("downloading preboot mts to target at address 0x%x (%zu bytes)...\n",
+	       preboot.entry, preboot.size);
+
+	ret = download_binary(RCM_CMD_DL_MTS, usb, &preboot);
+	if (ret) {
+		fprintf(stderr, "Error downloading preboot mts\n");
+		return ret;
+	}
+
+	printf("preboot mts downloaded successfully\n");
+
+	return 0;
+}
+
+static int initialize_miniloader(usb_device_t *usb, const char *mlfile, uint32_t mlentry)
+{
+	struct binary miniloader;
+	void *data = NULL;
+	struct stat sb;
+	int fd, ret;
 
 	// use prebuilt miniloader if not loading from a file
 	if (mlfile) {
@@ -458,43 +551,30 @@ static int initialize_miniloader(uint16_t devid, usb_device_t *usb, char *mlfile
 			dprintf("error on fstat of %s\n", mlfile);
 			return ret;
 		}
-		miniloader_size = sb.st_size;
-		miniloader = (uint8_t *)malloc(miniloader_size);
-		if (!miniloader) {
-			dprintf("error allocating %d bytes for miniloader\n", miniloader_size);
+		miniloader.size = sb.st_size;
+		data = malloc(miniloader.size);
+		if (!data) {
+			dprintf("error allocating %zu bytes for miniloader\n", miniloader.size);
 			return errno;
 		}
-		if (read(fd, miniloader, miniloader_size) != miniloader_size) {
+		if (read(fd, data, miniloader.size) != miniloader.size) {
 			dprintf("error reading from miniloader file");
 			return errno;
 		}
-		miniloader_entry = mlentry;
+		miniloader.entry = mlentry;
+		miniloader.data = data;
 	} else {
-		if ((devid & 0xff) == USB_DEVID_NVIDIA_TEGRA20) {
-			miniloader = miniloader_tegra20;
-			miniloader_size = sizeof(miniloader_tegra20);
-			miniloader_entry = TEGRA20_MINILOADER_ENTRY;
-		} else if ((devid & 0xff) == USB_DEVID_NVIDIA_TEGRA30) {
-			miniloader = miniloader_tegra30;
-			miniloader_size = sizeof(miniloader_tegra30);
-			miniloader_entry = TEGRA30_MINILOADER_ENTRY;
-		} else if ((devid & 0xff) == USB_DEVID_NVIDIA_TEGRA114) {
-			miniloader = miniloader_tegra114;
-			miniloader_size = sizeof(miniloader_tegra114);
-			miniloader_entry = TEGRA114_MINILOADER_ENTRY;
-		} else if ((devid & 0xff) == USB_DEVID_NVIDIA_TEGRA124) {
-			miniloader = miniloader_tegra124;
-			miniloader_size = sizeof(miniloader_tegra124);
-			miniloader_entry = TEGRA124_MINILOADER_ENTRY;
-		} else {
-			fprintf(stderr, "unknown tegra device: 0x%x\n", devid);
-			return ENODEV;
+		/* check for a built-in miniloader */
+		if (!usb->soc->miniloader.data) {
+			fprintf(stderr, "no built-in miniloader for %s\n", usb->soc->name);
+			return -ENOENT;
 		}
+
+		memcpy(&miniloader, &usb->soc->miniloader, sizeof(miniloader));
 	}
-	printf("downloading miniloader to target at address 0x%x (%d bytes)...\n",
-		miniloader_entry, miniloader_size);
-	ret = download_miniloader(usb, miniloader, miniloader_size,
-				  miniloader_entry);
+	printf("downloading miniloader to target at address 0x%x (%zu bytes)...\n",
+		miniloader.entry, miniloader.size);
+	ret = download_binary(RCM_CMD_DL_MINILOADER, usb, &miniloader);
 	if (ret) {
 		fprintf(stderr, "Error downloading miniloader\n");
 		return ret;
@@ -617,29 +697,32 @@ fail:
 }
 
 
-static int download_miniloader(usb_device_t *usb, uint8_t *miniloader,
-			       uint32_t size, uint32_t entry)
+static int download_binary(uint32_t cmd, usb_device_t *usb, struct binary *binary)
 {
-	uint8_t *msg_buff;
-	int ret;
+	int ret, actual_len;
 	uint32_t status;
-	int actual_len;
+	void *msg_buff;
 
-	// download the miniloader to the bootrom
-	rcm_create_msg(RCM_CMD_DL_MINILOADER,
-		       (uint8_t *)&entry, sizeof(entry), miniloader, size,
-		       &msg_buff);
-	ret = usb_write(usb, msg_buff, rcm_get_msg_len(msg_buff));
-	if (ret)
+	// create download message
+	rcm_create_msg(usb->soc->rcm, cmd, &binary->entry, sizeof(binary->entry),
+		       binary->data, binary->size, &msg_buff);
+	ret = usb_write(usb, msg_buff, rcm_get_msg_len(usb->soc->rcm, msg_buff));
+	if (ret) {
+		dprintf("error sending %x command to target\n", cmd);
 		goto fail;
+	}
 	ret = usb_read(usb, (uint8_t *)&status, sizeof(status), &actual_len);
-	if (ret)
+	if (ret) {
+		dprintf("error reading status from target\n");
 		goto fail;
+	}
 	if (actual_len < sizeof(status)) {
+		dprintf("short read of status\n");
 		ret = EIO;
 		goto fail;
 	}
 	if (status != 0) {
+		dprintf("got bad status: %x\n", status);
 		ret = EIO;
 		goto fail;
 	}
@@ -691,6 +774,11 @@ static void dump_platform_info(nv3p_platform_info_t *info)
 		switch (info->sku) {
 		case TEGRA124_CHIP_SKU_T124:
 		default: chip_name = "t124"; break;
+		}
+	} else if (info->chip_id.id == 0x13) {
+		switch (info->sku) {
+		case TEGRA132_CHIP_SKU_T132:
+		default: chip_name = "t132"; break;
 		}
 	} else {
 		chip_name = "unknown";
@@ -775,7 +863,7 @@ static int read_bct(nv3p_handle_t h3p, char *filename)
 		goto out;
 	}
 
-	bct_data = (uint8_t *)malloc(bct_info.length);
+	bct_data = malloc(bct_info.length);
 	ret = nv3p_data_recv(h3p, bct_data, bct_info.length);
 	if (ret) {
 		dprintf("error retreiving bct data\n");
@@ -812,8 +900,7 @@ out:
 	return ret;
 }
 
-static int download_bootloader(nv3p_handle_t h3p, char *filename,
-			       uint32_t entry, uint32_t loadaddr)
+static int download_bootloader(nv3p_handle_t h3p, char *filename, uint32_t entry, uint32_t loadaddr)
 {
 	int ret;
 	nv3p_cmd_dl_bl_t arg;
@@ -853,6 +940,60 @@ static int download_bootloader(nv3p_handle_t h3p, char *filename,
 	ret = send_file(h3p, filename);
 	if (ret) {
 		dprintf("error downloading bootloader\n");
+		return ret;
+	}
+
+	ret = wait_status(h3p);
+	if (ret) {
+		dprintf("error waiting for status on bootloader dl\n");
+		return ret;
+	}
+
+	return 0;
+}
+
+static int download_mts(nv3p_handle_t h3p, char *filename, uint32_t loadaddr)
+{
+	nv3p_cmd_dl_mts_t arg;
+	struct stat sb;
+	int ret, fd;
+
+	if (!filename)
+		return -EINVAL;
+
+	fd = open(filename, O_RDONLY, 0);
+	if (fd < 0) {
+		dprintf("error opening %s for reading\n", filename);
+		return errno;
+	}
+
+	ret = fstat(fd, &sb);
+	if (ret) {
+		dprintf("error on fstat of %s\n", filename);
+		return errno;
+	}
+
+	close(fd);
+
+	arg.length = sb.st_size;
+	arg.address = loadaddr;
+
+	ret = nv3p_cmd_send(h3p, NV3P_CMD_DL_MTS, (uint8_t *)&arg);
+	if (ret) {
+		dprintf("error sending 3p mts download command\n");
+		return ret;
+	}
+
+	// send the mts file
+	ret = send_file(h3p, filename);
+	if (ret) {
+		dprintf("error downloading mts\n");
+		return ret;
+	}
+
+	ret = wait_status(h3p);
+	if (ret) {
+		dprintf("error waiting for status on mts dl\n");
 		return ret;
 	}
 
